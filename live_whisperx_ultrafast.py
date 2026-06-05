@@ -8,6 +8,7 @@ import time
 import sys
 import ollama
 import asyncio
+import gradio as gr
 from faster_whisper import WhisperModel
 from kittentts import KittenTTS
 import sounddevice as sd
@@ -18,19 +19,37 @@ CHANNELS = 1
 DTYPE = "int16"
 
 GAIN = 1.0                 # mic gain
-VAD_MODE = 2               # 0–3
-MIN_SPEECH_SEC = 0.8
+VAD_MODE = 3               # 0–3
+MIN_SPEECH_SEC = 1.2
 END_SILENCE_SEC = 0.6
 MAX_BUFFER_SEC = 4.0
 
 FRAME_MS = 30
 FRAME_SIZE = int(SAMPLE_RATE * FRAME_MS / 1000)
-LLM_MODEL = "llama3.1:latest"
+# LLM_MODEL = "llama3.1:latest"
+LLM_MODEL = "gpt-oss:120b-cloud"
+
 TTS_MODEL = KittenTTS("KittenML/kitten-tts-nano-0.2")
 
 TTS_SR = 24000
 TTS_VOICE = "expr-voice-5-f"
 # =========================================
+
+# =============Memory buffer===============
+
+conversation = []
+MAX_TURNS = 6  # last N exchanges
+
+assistant_running = False
+assistant_status = "Idle"
+
+latest_transcript = ""
+latest_reply = ""
+
+
+
+# =========================================
+
 
 vad = webrtcvad.Vad(VAD_MODE)
 audio_q = queue.Queue()
@@ -40,7 +59,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 compute_type = "float16" if device == "cuda" else "int8"
 
 model = WhisperModel(
-    "small",               # tiny / base / small
+    "medium.en",               # tiny / base / small
     device=device,
     compute_type=compute_type
 )
@@ -61,20 +80,23 @@ def audio_callback(indata, frames, time_info, status):
 # ==================ollama=========================
 ollama_q = queue.Queue()
 
-async def ask_ollama_async(user_text: str) -> str:
+# async def ask_ollama_async(user_text: str) -> str:
+async def ask_ollama_async(messages: list) -> str:
+
     response = await asyncio.to_thread(
         ollama.chat,
         model=LLM_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a concise voice assistant. Keep responses short."
-            },
-            {
-                "role": "user",
-                "content": user_text
-            }
-        ],
+        messages=messages,
+        # messages=[
+        #     {
+        #         "role": "system",
+        #         "content": "You are a concise voice assistant. Keep responses short."
+        #     },
+        #     {
+        #         "role": "user",
+        #         "content": user_text
+        #     }
+        # ],
         options={
             "temperature": 0.4,
             "num_ctx": 2048
@@ -84,62 +106,172 @@ async def ask_ollama_async(user_text: str) -> str:
     return response["message"]["content"].strip()
 
 def ollama_worker():
+    global conversation, latest_reply, assistant_status
+
+    # ✅ create event loop ONCE, at thread start
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     while True:
         user_text = ollama_q.get()
-        if not user_text:
-            continue
 
+        assistant_status = "Thinking"
+
+        # store user message
+        conversation.append({"role": "user", "content": user_text})
+        conversation = conversation[-MAX_TURNS * 2:]
+
+        # build chat messages (CORRECT way)
+        messages = [
+            {"role": "system", "content": "You are a concise voice assistant."}
+        ] + conversation
+
+        # ✅ run async Ollama call properly
         reply = loop.run_until_complete(
-            ask_ollama_async(user_text)
+            ask_ollama_async(messages)
         )
 
-        print(f"\n🤖 Kitty: {reply}")
-        # send to TTS
+        # store assistant reply
+        conversation.append({"role": "assistant", "content": reply})
+
+        latest_reply = reply
+        assistant_status = "Speaking"
+
+        print(f"\n🤖 OLLAMA: {reply}")
         tts_q.put(reply)
+
+# 2nd ollama worker
+# def ollama_worker():
+#     global conversation, latest_reply, assistant_status
+#     messages = [{"role": "system", "content": "You are a concise voice assistant."}] + conversation
+    
+#     loop = asyncio.new_event_loop()
+#     reply = loop.run_until_complete(ask_ollama_async(messages))
+#     asyncio.set_event_loop(loop)
+
+#     while True:
+#         user_text = ollama_q.get()
+
+#         conversation.append({"role": "user", "content": user_text})
+#         conversation = conversation[-MAX_TURNS * 2:]
+
+#         prompt = ""
+#         for msg in conversation:
+#             role = "User" if msg["role"] == "user" else "Assistant"
+#             prompt += f"{role}: {msg['content']}\n"
+
+#         prompt += "Assistant:"
+
+#         # ✅ CORRECT: actually run the coroutine
+#         reply = loop.run_until_complete(
+#             ask_ollama_async(prompt)
+#         )
+
+#         conversation.append({"role": "assistant", "content": reply})
+
+#         print(f"\n🤖 OLLAMA: {reply}")
+#         latest_reply = reply
+#         assistant_status = "Speaking"
+#         tts_q.put(reply)
+
+
+
+# OG ollama_worker
+# def ollama_worker():
+#     loop = asyncio.new_event_loop()
+#     asyncio.set_event_loop(loop)
+
+#     while True:
+#         user_text = ollama_q.get()
+#         if not user_text:
+#             continue
+
+#         reply = loop.run_until_complete(
+#             ask_ollama_async(user_text)
+#         )
+
+#         print(f"\n🤖 Kitty: {reply}")
+#         # send to TTS
+#         tts_q.put(reply)
 
 # ================= Kitten-TTS =================
 tts_q = queue.Queue()
+
 def tts_worker():
+    global assistant_status
     while True:
         text = tts_q.get()
 
-        if not text.strip():
+        if not text or not text.strip():
+            assistant_status = "Listening"
             continue
 
         try:
-            audio = TTS_MODEL.generate(
-                text,
-                voice=TTS_VOICE
-            )
+            assistant_status = "Speaking"
 
-            # # Play audio directly (no file needed)
-            # audio = np.ascontiguousarray(audio, dtype=np.float32)
-            # sd.play(audio, samplerate=TTS_SR)
-            # sd.wait()  # blocking here is OK
+            audio = TTS_MODEL.generate(text, voice=TTS_VOICE)
+            audio = np.asarray(audio, dtype=np.float32)
+
             with sd.OutputStream(
                 samplerate=TTS_SR,
                 channels=1,
-                dtype='float32'
-                ) as stream:
+                dtype="float32"
+            ) as stream:
                 stream.write(audio)
-
 
         except Exception as e:
             print("TTS error:", e)
+
+        finally:
+            assistant_status = "Listening"
+
+# OG tts_worker
+# def tts_worker():
+#     global assistant_status
+#     while True:
+#         text = tts_q.get()
+
+#         if not text.strip():
+#             continue
+
+#         try:
+#             audio = TTS_MODEL.generate(
+#                 text,
+#                 voice=TTS_VOICE
+#             )
+
+#             # # Play audio directly (no file needed)
+#             # audio = np.ascontiguousarray(audio, dtype=np.float32)
+#             # sd.play(audio, samplerate=TTS_SR)
+#             # sd.wait()  # blocking here is OK
+#             with sd.OutputStream(
+#                 samplerate=TTS_SR,
+#                 channels=1,
+#                 dtype='float32'
+#                 ) as stream:
+#                 stream.write(audio)
+            
+#             assistant_status = "Listening"
+
+
+
+#         except Exception as e:
+#             print("TTS error:", e)
 
 
 
 # ================= PROCESS THREAD =================
 def processor():
+    global latest_transcript, assistant_status
     buffer = b""
     speech_time = 0.0
     speaking = False
     last_voice = time.time()
 
     while True:
+        if not assistant_running:
+            time.sleep(0.1)
+            continue
         frame = audio_q.get()
         # buffer += frame
 
@@ -173,6 +305,8 @@ def processor():
 
                 text = "".join(seg.text for seg in segments).strip()
                 if text:
+                    latest_transcript = text
+                    assistant_status = "Thinking"
                     print(f"\n🗣️  YOU SAID: {text}")
 
                     ollama_q.put(text)#calling ollama function
@@ -183,6 +317,9 @@ def processor():
 
                 buffer = b""
                 speech_time = 0.0
+                
+        
+
 
 
 # ================= CONTROL =================
@@ -197,6 +334,22 @@ def stop():
     running = False
     print("\n⏹️ Stopped")
 
+def start_assistant():
+    global assistant_running, assistant_status, running
+    assistant_running = True
+    running = True
+    assistant_status = "Listening"
+    return "Assistant started"
+
+def stop_assistant():
+    global assistant_running, assistant_status, running
+    assistant_running = False
+    running = False
+    assistant_status = "Stopped"
+    return "Assistant stopped"
+
+def ui_refresh():
+    return latest_transcript, latest_reply, assistant_status
 
 # ================= MAIN =================
 stream = sd.InputStream(
@@ -213,11 +366,42 @@ threading.Thread(target=processor, daemon=True).start() # Whisper processing thr
 threading.Thread(target=ollama_worker,daemon=True).start() # Ollama async worker thread
 threading.Thread(target=tts_worker, daemon=True).start() # Kitten-TTS worker thread
 
-print("Press ENTER to START / STOP | Ctrl+C to exit")
+# print("Press ENTER to START / STOP | Ctrl+C to exit")
 
-try:
-    while True:
-        input()
-        stop() if running else start()
-except KeyboardInterrupt:
-    sys.exit(0)
+# try:
+#     while True:
+#         input()
+#         stop() if running else start()
+# except KeyboardInterrupt:
+#     sys.exit(0)
+
+# ==================Gradio=================
+with gr.Blocks(title="LiL-Kitty Assistant") as demo:
+    gr.Markdown("## 🐱 LiL-Kitty Voice Assistant")
+
+    with gr.Row():
+        start_btn = gr.Button("🎙 Start")
+        stop_btn = gr.Button("⏹ Stop")
+
+    status = gr.Textbox(label="Status", interactive=False)
+
+    user_box = gr.Textbox(label="You said", interactive=False)
+    assistant_box = gr.Textbox(label="Assistant replied", interactive=False)
+
+    start_btn.click(start_assistant, outputs=status)
+    stop_btn.click(stop_assistant, outputs=status)
+
+    refresh_timer = gr.Timer(0.5)
+    refresh_timer.tick(
+    ui_refresh,
+    outputs=[user_box, assistant_box, status]
+    )
+
+#     demo.load(
+#         ui_refresh,
+#         outputs=[user_box, assistant_box, status],every=0.5   # refresh twice per second
+#     )
+
+demo.launch()
+
+# =========================================
